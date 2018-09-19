@@ -1,0 +1,226 @@
+#+TITLE:Draw GitHub contributions
+
+;; https://github.com/oracle/graal/releases
+
+Draw a picture into the contributions part of your GitHub profile.
+
+* How to read the code
+
+This is a litterate README which describes how this small program is
+built and works. This an a posteriori description.
+
+** Declare external code you'll use
+
+A Clojure program file usually describe a _namespace_, so they start
+with =ns=. Our main file isn't any different. Here is all libraries we
+intend to use:
+
+#+BEGIN_SRC clojure :tangle src/draw_github_contributions/core.clj
+  (ns draw-github-contributions.core
+    (:gen-class)
+    (:require [mikera.image.core :as img]
+	      [clj-jgit.porcelain :as git]
+	      [clojure.spec.alpha :as spec])
+    (:import (java.time LocalDate ZoneId ZonedDateTime)
+	     (java.util Date)
+	     (org.eclipse.jgit.api CommitCommand Git)
+	     (org.eclipse.jgit.lib PersonIdent)
+	     (java.awt.image BufferedImage)))
+#+END_SRC
+
+The =:import= part declares Java libraries. It is very similar to Java
+imports. The =:require= part is quite the same, but for Clojure
+libraries.
+
+Here we declare our intent to use several image manipulation related
+libraries, as well as libraries about date and git
+manipulation. Moreover, =lojure.spec.alpha=, referred as =spec= later
+in the code, will enable us to describe shape of data. I've found it
+quite helpful during development to catch mistakes and make sure data
+always look like what I expect at some point in the code. I also
+envision it to be quite helpful when somebody will have to make this
+code evolve: with =spec= it will give them proper invariant
+insurances. Combined with tests, this should streamline the evolution
+process and make it way easier.
+
+** Define constants
+
+#+BEGIN_SRC clojure :tangle src/draw_github_contributions/core.clj
+  (def number-of-weeks 52)
+  (def number-of-weekdays 7)
+#+END_SRC
+
+** Define helper functions
+
+#+BEGIN_SRC clojure :tangle src/draw_github_contributions/core.clj
+  (defn ->java-zoned-date-time
+    (^ZonedDateTime [^Integer year ^Integer month ^Integer dayOfMonth]
+     (-> (LocalDate/of year month dayOfMonth)
+	 (.atStartOfDay (ZoneId/of "UTC")))))
+
+  (defn ->java-date
+    (^Date [^ZonedDateTime zoned-date-time]
+     (-> zoned-date-time
+	 .toInstant
+	 Date/from)))
+
+  (defn transpose [m]
+    (apply mapv vector m))
+#+END_SRC
+
+** Define specs
+
+#+BEGIN_SRC clojure :tangle src/draw_github_contributions/core.clj
+  (def strict-pos-int? #(and (number? %) (or (zero? %) (pos-int? %))))
+  (def zone-date-time? #(instance? ZonedDateTime %))
+
+  (spec/def :commits/number strict-pos-int?)
+  (spec/def :commits/date zone-date-time?)
+  (spec/def ::grid-element (spec/keys :req [:commits/number
+					    :commits/date]))
+  (spec/def ::no-twice-same-date (fn no-twice-same-date [grid-elements]
+				   (->> grid-elements
+					(group-by :commits/date)
+					vals
+					(map count)
+					set
+					(= #{1}))))
+  (spec/def ::grid (spec/and #(= number-of-weeks (count %))
+			     (spec/coll-of (spec/and (spec/coll-of ::grid-element)
+						     ::no-twice-same-date
+						     #(= number-of-weekdays (count %))))))
+  (spec/def ::colours-I-know #{-1 -16777216})
+  (spec/def :committer/name string?)
+  (spec/def :committer/email string?)
+  (spec/def :config/committer (spec/keys :req [:committer/name :committer/email]))
+  (spec/def :config/number-of-commits strict-pos-int?)
+  (spec/def :config/bottom-right-hand-corner-date zone-date-time?)
+  (spec/def :config/image-resource #(instance? BufferedImage %))
+  (spec/def :config/repository #(instance? Git %))
+  (spec/def :config/side-effects? boolean?)
+
+  (spec/def ::config (spec/keys :req [:config/number-of-commits
+				      :config/bottom-right-hand-corner-date
+				      :config/image-resource]
+				:opt [:config/committer
+				      :config/repository
+				      :config/side-effects?]))
+#+END_SRC
+
+** Define the core logic
+
+Think about the order. Perhaps it's better to show untangled code
+first, then output it in the clj reverse order.
+
+#+BEGIN_SRC clojure :tangle src/draw_github_contributions/core.clj
+  (defn generate-commits!
+    [^Git repo config java-date]
+    (-> repo
+	^CommitCommand (.commit)
+	(.setMessage "")
+	(.setAllowEmpty true) ;; explicit
+	(.setCommitter (PersonIdent. (PersonIdent.
+				       ^String (-> config :config/committer :committer/name)
+				       ^String (-> config :config/committer :committer/email))
+				     ^Date java-date))
+	(.call)))
+
+  (defn empty-pixel?
+    "Depends on spec `::colours-I-know`."
+    [pixel]
+    (not= -1 pixel))
+
+  (defn tranpose-data-representation [grid-elements]
+    (->> grid-elements
+	 (partition number-of-weeks)
+	 transpose
+	 (mapcat identity)))
+
+  (defn fill-commits-dates [number-of-weeks number-of-weekdays reference-date grid-elements]
+    (let [distance-from-reference-date #(- (* number-of-weeks
+					      number-of-weekdays)
+					   (inc %))]
+      (->> grid-elements
+	   (map-indexed (fn [i grid-element]
+			  (assoc grid-element
+			    :commits/date (.minusDays reference-date (distance-from-reference-date i))))))))
+
+  (defn fill-commits-numbers [number-of-commits image-pixels]
+    (->> image-pixels
+	 (map (fn [pixel]
+		{:commits/number (if (empty-pixel? pixel)
+				   number-of-commits
+				   0)}))))
+
+  (defn assert-workable-image [image-pixels]
+    (assert (and (spec/valid? (spec/coll-of ::colours-I-know)
+			      image-pixels)
+		 #(= (count image-pixels)
+		     (* number-of-weeks
+			number-of-weekdays))))
+    image-pixels)
+
+  (defn get-image-pixels [image-resource]
+    (->> image-resource
+	 img/get-pixels
+	 seq))
+
+  (defn ->grid-elements
+    [config]
+    (let [{:config/keys [bottom-right-hand-corner-date image-resource number-of-commits]} config
+	  reference-date ^ZonedDateTime bottom-right-hand-corner-date]
+      (->> (get-image-pixels image-resource)
+	   assert-workable-image
+	   (fill-commits-numbers number-of-commits)
+	   tranpose-data-representation
+	   (fill-commits-dates number-of-weeks number-of-weekdays reference-date))))
+#+END_SRC
+
+** Define the main functions
+
+#+BEGIN_SRC clojure :tangle src/draw_github_contributions/core.clj
+  (def default-config
+    {:config/committer {:committer/name "Fake Contribution"
+			:committer/email "piotr-yuxuan@users.noreply.github.com"}
+     :config/number-of-commits 150
+     :config/bottom-right-hand-corner-date (->java-zoned-date-time 2018 9 22)
+     :config/image-resource (img/load-image-resource "contributions.png")
+     :config/repository (git/load-repo "../fake-contributions")})
+
+  (defn -main
+    [& {:as runtime-config}]
+    (let [actual-config (merge default-config runtime-config)]
+      (assert (spec/valid? ::config actual-config))
+      (let [{:config/keys [side-effects? repository]} actual-config
+	    grid-elements (->grid-elements actual-config)]
+	(assert (spec/valid? ::grid (partition number-of-weekdays grid-elements)))
+	(doseq [{:commits/keys [number date]} grid-elements]
+	  (let [java-date (->java-date date)]
+	    (when side-effects?
+	      (doall (repeatedly number #(generate-commits! repository actual-config java-date))))))
+	grid-elements)))
+#+END_SRC
+
+** Describe how to use this program
+
+#+BEGIN_SRC clojure :tangle src/draw_github_contributions/core.clj
+  (comment
+    ;; $ cd ../fake-contributions
+    ;; $ rm -rf .git
+    ;; $ git init .
+    ;; $ git add .
+    ;; $ git remote add origin git@github.com:piotr-yuxuan/fake-contributions.git
+    (-main :config/side-effects? true)
+    ;; $ git push -u origin master
+    )
+#+END_SRC
+
+** Going further: make an native executable
+
+#+BEGIN_SRC clojure
+#+END_SRC
+
+** Describe how to use the executable
+
+#+BEGIN_SRC clojure
+#+END_SRC

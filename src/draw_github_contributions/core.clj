@@ -1,102 +1,63 @@
 (ns draw-github-contributions.core
   (:gen-class)
-  (:require [mikera.image.core :as img]
-            [clj-jgit.porcelain :as git]
-            [clojure.spec.alpha :as spec])
-  (:import (java.time LocalDate ZoneId ZonedDateTime)
-           (java.util Date)
-           (org.eclipse.jgit.api CommitCommand Git)
-           (org.eclipse.jgit.lib PersonIdent)
-           (java.awt.image BufferedImage)))
+  (:require [clojure.java.shell :as shell]
+            [clojure.java.io :as io]
+            [clojure.string :as str])
+  (:import (java.time LocalDate)
+           (java.awt.image BufferedImage)
+           (javax.imageio ImageIO)
+           (java.io File)))
 
 (def number-of-weeks 52)
 (def number-of-weekdays 7)
 
-(def strict-pos-int? #(and (number? %) (or (zero? %) (pos-int? %))))
-(def zone-date-time? #(instance? ZonedDateTime %))
-
-(spec/def :commits/number strict-pos-int?)
-(spec/def :commits/date zone-date-time?)
-(spec/def ::grid-element (spec/keys :req [:commits/number
-                                          :commits/date]))
-(spec/def ::no-twice-same-date (fn no-twice-same-date [grid-elements]
-                                 (->> grid-elements
-                                      (group-by :commits/date)
-                                      vals
-                                      (map count)
-                                      set
-                                      (= #{1}))))
-(spec/def ::grid (spec/and #(= number-of-weeks (count %))
-                           (spec/coll-of (spec/and (spec/coll-of ::grid-element)
-                                                   ::no-twice-same-date
-                                                   #(= number-of-weekdays (count %))))))
-(spec/def ::colours-I-know #{-1 -16777216})
-(spec/def :committer/name string?)
-(spec/def :committer/email string?)
-(spec/def :config/committer (spec/keys :req [:committer/name :committer/email]))
-(spec/def :config/number-of-commits strict-pos-int?)
-(spec/def :config/bottom-right-hand-corner-date zone-date-time?)
-(spec/def :config/image-resource #(instance? BufferedImage %))
-(spec/def :config/repository #(instance? Git %))
-(spec/def :config/side-effects? boolean?)
-
-(spec/def ::config (spec/keys :req [:config/number-of-commits
-                                    :config/bottom-right-hand-corner-date
-                                    :config/image-resource]
-                              :opt [:config/committer
-                                    :config/repository
-                                    :config/side-effects?]))
-
 (defn transpose [m]
   (apply mapv vector m))
 
-(defn ->java-zoned-date-time
-  (^ZonedDateTime [^Integer year ^Integer month ^Integer dayOfMonth]
-   (-> (LocalDate/of year month dayOfMonth)
-       (.atStartOfDay (ZoneId/of "UTC")))))
-
-(defn ->java-date
-  (^Date [^ZonedDateTime zoned-date-time]
-   (-> zoned-date-time
-       .toInstant
-       Date/from)))
+(defn local-date->git-date
+  "MM/DD/YYYY"
+  [^LocalDate java-date]
+  (str (.getYear java-date) "-"
+       (let [month (str (.getMonthValue java-date))]
+         (str (when (= 1 (count month)) "0")
+              month)) "-"
+       (let [day-of-month (str (.getDayOfMonth java-date))]
+         (str (when (= 1 (count day-of-month)) "0")
+              day-of-month))
+       "T00:00:00+00:00"))
 
 (defn generate-commits!
-  [^Git repo config java-date]
-  (-> repo
-      ^CommitCommand (.commit)
-      (.setMessage "")
-      (.setAllowEmpty true) ;; explicit
-      (.setCommitter (PersonIdent. (PersonIdent.
-                                     ^String (-> config :config/committer :committer/name)
-                                     ^String (-> config :config/committer :committer/email))
-                                   ^Date java-date))
-      (.call)))
+  "Quite slow. `jgit` would be way faster but it doesn't currently work on GraalVM."
+  [config date]
+  (let [committer (:config/committer config)
+        author (str "--author='" (:committer/name committer) " <" (:committer/email committer) ">'")
+        date (str "--date=" (local-date->git-date date))
+        all-modified-files "--all"
+        allow-empty "--allow-empty"
+        allow-empty-message "--allow-empty-message"
+        no-gpg-sign "--no-gpg-sign"
+        no-pre-commit-verification-hooks "--no-verify"]
+    (when (:config/side-effects? config)
+      (shell/with-sh-dir (:config/repository-path config)
+        (shell/sh "git" "commit"
+                  author date
+                  allow-empty all-modified-files
+                  allow-empty-message
+                  no-gpg-sign no-pre-commit-verification-hooks))
+      (->> ["git" "commit"
+            author date
+            allow-empty all-modified-files
+            allow-empty-message
+            no-gpg-sign no-pre-commit-verification-hooks]
+           (str/join " ")
+           pr-str
+           println))))
 
 (defn empty-pixel?
-  "Depends on spec `::colours-I-know`."
+  "Important domain function which is relied on by tests, spec and core
+  logic."
   [pixel]
-  (not= -1 pixel))
-
-(defn get-image-pixels [image-resource]
-  (->> image-resource
-       img/get-pixels
-       seq))
-
-(defn assert-workable-image [image-pixels]
-  (assert (and (spec/valid? (spec/coll-of ::colours-I-know)
-                            image-pixels)
-               #(= (count image-pixels)
-                   (* number-of-weeks
-                      number-of-weekdays))))
-  image-pixels)
-
-(defn fill-commits-numbers [number-of-commits image-pixels]
-  (->> image-pixels
-       (map (fn [pixel]
-              {:commits/number (if (empty-pixel? pixel)
-                                 number-of-commits
-                                 0)}))))
+  (= [0 0 0] pixel))
 
 (defn tranpose-data-representation [grid-elements]
   (->> grid-elements
@@ -104,52 +65,65 @@
        transpose
        (mapcat identity)))
 
-(defn fill-commits-dates [number-of-weeks number-of-weekdays reference-date grid-elements]
-  (let [distance-from-reference-date #(- (* number-of-weeks
+(defn fill-commits-dates [number-of-weeks number-of-weekdays config-date grid-elements]
+  (let [[^int year ^int month ^int day-of-month] config-date
+        reference-date (LocalDate/of year month day-of-month)
+        distance-from-reference-date #(- (* number-of-weeks
                                             number-of-weekdays)
                                          (inc %))]
-    (->> grid-elements
-         (map-indexed (fn [i grid-element]
+    (map-indexed (fn [i grid-element]
+                   (->> i
+                        distance-from-reference-date
+                        (.minusDays reference-date)
                         (assoc grid-element
-                          :commits/date (.minusDays reference-date (distance-from-reference-date i))))))))
+                          :commits/date)))
+                 grid-elements)))
+
+(defn fill-commits-number
+  [number-of-commits pixel]
+  {:commits/number (if (empty-pixel? pixel)
+                     number-of-commits
+                     0)})
+
+(defn get-image-pixels [image-path]
+  (let [^BufferedImage image (ImageIO/read ^File (io/as-file image-path))]
+    (->> (.getDataElements (.getRaster image)
+                           (int 0) ;; x
+                           (int 0) ;; y
+                           (int (.getWidth image))
+                           (int (.getHeight image))
+                           nil ;; just kidding bro, don't mess with it
+                           )
+         ^ints vec
+         (partition 3))))
 
 (defn ->grid-elements
   [config]
-  (let [{:config/keys [bottom-right-hand-corner-date image-resource number-of-commits]} config
-        reference-date ^ZonedDateTime bottom-right-hand-corner-date]
-    (->> (get-image-pixels image-resource)
-         assert-workable-image
-         (fill-commits-numbers number-of-commits)
+  (let [{:config/keys [bottom-right-hand-corner-date image-path number-of-commits]} config
+        ;; way easier to read
+        config-date bottom-right-hand-corner-date]
+    (->> (get-image-pixels image-path)
+         (map #(fill-commits-number number-of-commits %))
          tranpose-data-representation
-         (fill-commits-dates number-of-weeks number-of-weekdays reference-date))))
+         (fill-commits-dates number-of-weeks number-of-weekdays config-date))))
 
 (def default-config
   {:config/committer {:committer/name "Fake Contribution"
                       :committer/email "piotr-yuxuan@users.noreply.github.com"}
-   :config/number-of-commits 150
-   :config/bottom-right-hand-corner-date (->java-zoned-date-time 2018 9 22)
-   :config/image-resource (img/load-image-resource "contributions.png")
-   :config/repository (git/load-repo "../fake-contributions")})
+   :config/number-of-commits 69
+   :config/bottom-right-hand-corner-date [2018 9 22] ;; fuck you java.util.Date
+   :config/image-path "resources/contributions.png"
+   :config/repository-path "../fake-contributions"})
 
 (defn -main
-  [& {:as runtime-config}]
-  (let [actual-config (merge default-config runtime-config)]
-    (assert (spec/valid? ::config actual-config))
-    (let [{:config/keys [side-effects? repository]} actual-config
-          grid-elements (->grid-elements actual-config)]
-      (assert (spec/valid? ::grid (partition number-of-weekdays grid-elements)))
-      (doseq [{:commits/keys [number date]} grid-elements]
-        (let [java-date (->java-date date)]
-          (when side-effects?
-            (doall (repeatedly number #(generate-commits! repository actual-config java-date))))))
-      grid-elements)))
+  [& {:as args}]
+  (let [runtime-config (->> args
+                            (map (fn [[k v]]
+                                   [(clojure.edn/read-string k) (clojure.edn/read-string v)]))
+                            (into {}))
+        actual-config (merge default-config runtime-config)]
+    (->> (->grid-elements actual-config)
+         (mapcat (fn [{:commits/keys [number date]}]
+                   (repeatedly number #(generate-commits! actual-config date))))
+         doall)))
 
-(comment
-  ;; $ cd ../fake-contributions
-  ;; $ rm -rf .git
-  ;; $ git init .
-  ;; $ git add .
-  ;; $ git remote add origin git@github.com:piotr-yuxuan/fake-contributions.git
-  (-main :config/side-effects? true)
-  ;; $ git push -u origin master
-  )
