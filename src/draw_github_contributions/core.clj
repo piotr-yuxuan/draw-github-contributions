@@ -35,23 +35,24 @@
         all-modified-files "--all"
         allow-empty "--allow-empty"
         allow-empty-message "--allow-empty-message"
+        empty-message-flag "-m"
+        empty-message ""
         no-gpg-sign "--no-gpg-sign"
         no-pre-commit-verification-hooks "--no-verify"]
-    (when (:config/side-effects? config)
+    (if (:config/side-effects? config)
       (shell/with-sh-dir (:config/repository-path config)
         (shell/sh "git" "commit"
                   author date
                   allow-empty all-modified-files
-                  allow-empty-message
+                  allow-empty-message empty-message-flag empty-message
                   no-gpg-sign no-pre-commit-verification-hooks))
-      (->> ["git" "commit"
-            author date
-            allow-empty all-modified-files
-            allow-empty-message
-            no-gpg-sign no-pre-commit-verification-hooks]
-           (str/join " ")
-           pr-str
-           println))))
+      ;; TODO Yes println is a side effect. To be renamed. The idea is
+      ;; to generate a 'pure' script, then have it executed.
+      (println "git" "commit"
+               author date
+               allow-empty all-modified-files
+               allow-empty-message empty-message-flag empty-message
+               no-gpg-sign no-pre-commit-verification-hooks))))
 
 (defn empty-pixel?
   "Important domain function which is relied on by tests, spec and core
@@ -111,7 +112,7 @@
   {:config/committer {:committer/name "Fake Contribution"
                       :committer/email "piotr-yuxuan@users.noreply.github.com"}
    :config/number-of-commits 69
-   :config/bottom-right-hand-corner-date [2018 9 22] ;; fuck you java.util.Date
+   :config/bottom-right-hand-corner-date [2019 9 7] ;; fuck you java.util.Date
    :config/image-path "resources/contributions.png"
    :config/repository-path "../fake-contributions"})
 
@@ -126,4 +127,3 @@
          (mapcat (fn [{:commits/keys [number date]}]
                    (repeatedly number #(generate-commits! actual-config date))))
          doall)))
-
